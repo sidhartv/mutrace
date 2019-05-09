@@ -138,6 +138,13 @@ struct cond_info {
         struct cond_info *next;
 };
 
+struct thread_file_info {
+    int tid;
+    FILE *fp;
+
+    struct thread_file_info *next;
+};
+
 static unsigned hash_size = 3371; /* probably a good idea to pick a prime here */
 static unsigned frames_max = 16;
 
@@ -180,6 +187,7 @@ static int (*real_pthread_rwlock_wrlock)(pthread_rwlock_t *rwlock) = NULL;
 static int (*real_pthread_rwlock_trywrlock)(pthread_rwlock_t *rwlock) = NULL;
 static int (*real_pthread_rwlock_timedwrlock)(pthread_rwlock_t *rwlock, const struct timespec *abstime) = NULL;
 static int (*real_pthread_rwlock_unlock)(pthread_rwlock_t *rwlock);
+static void (*real_pthread_exit)(void *value_ptr);
 static void (*real_exit)(int status) __attribute__((noreturn)) = NULL;
 static void (*real__exit)(int status) __attribute__((noreturn)) = NULL;
 static void (*real__Exit)(int status) __attribute__((noreturn)) = NULL;
@@ -193,10 +201,14 @@ static pthread_mutex_t *mutexes_lock = NULL;
 static struct cond_info **alive_conds = NULL, **dead_conds = NULL;
 static pthread_mutex_t *conds_lock = NULL;
 
+static struct thread_file_info **thread_files = NULL;
+static pthread_rwlock_t *thread_files_lock = NULL;
+
 static __thread bool recursive = false;
 
 static volatile bool initialized = false;
 static volatile bool threads_existing = false;
+static void log_event(unsigned int obj_type, void *obj_addr, unsigned int event_type);
 
 static uint64_t nsec_timestamp_setup;
 
@@ -397,6 +409,7 @@ static void load_functions(void) {
         LOAD_FUNC(pthread_rwlock_trywrlock);
         LOAD_FUNC(pthread_rwlock_timedwrlock);
         LOAD_FUNC(pthread_rwlock_unlock);
+        LOAD_FUNC(pthread_exit);
 
         /* There's some kind of weird incompatibility problem causing
          * pthread_cond_timedwait() to freeze if we don't ask for this
@@ -423,10 +436,10 @@ static void load_functions(void) {
 static void setup(void) {
         struct sigaction sigusr_action;
         pthread_mutex_t *m, *last;
+	pthread_rwlock_t *m_rw, *last_rw;
         int r;
         unsigned t;
         const char *s;
-
         load_functions();
 
         if (LIKELY(initialized))
@@ -440,7 +453,7 @@ static void setup(void) {
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-        if (__malloc_hook) {
+/*        if (__malloc_hook) {
 #pragma GCC diagnostic pop
                 fprintf(stderr,
                         "mutrace: Detected non-glibc memory allocator. Your program uses some\n"
@@ -448,17 +461,17 @@ static void setup(void) {
                         "mutrace: mutrace. Please rebuild your program with the standard memory\n"
                         "mutrace: allocator or fix mutrace to handle yours correctly.\n");
 
-                /* The reason for this is that jemalloc and other
+                // * The reason for this is that jemalloc and other
                  * allocators tend to call pthread_mutex_xxx() from
                  * the allocator. However, we need to call malloc()
                  * ourselves from some mutex operations so this might
                  * create an endless loop eventually overflowing the
                  * stack. glibc's malloc() does locking too but uses
                  * lock routines that do not end up calling
-                 * pthread_mutex_xxx(). */
+                 * pthread_mutex_xxx(). * /
 
                 real_exit(1);
-        }
+        } */
 
         t = hash_size;
         if (parse_env("MUTRACE_HASH_SIZE", &t) < 0 || t <= 0)
@@ -537,7 +550,6 @@ static void setup(void) {
 
         if (getenv("MUTRACE_TRACK_RT"))
                 track_rt = true;
-
         /* Set up the mutex hash table. */
         alive_mutexes = calloc(hash_size, sizeof(struct mutex_info*));
         assert(alive_mutexes);
@@ -568,6 +580,16 @@ static void setup(void) {
                 r = real_pthread_mutex_init(m, NULL);
 
                 assert(r == 0);
+        }
+
+	thread_files = calloc(hash_size, sizeof(struct thread_file_info*));
+	assert(thread_files);
+
+        thread_files_lock = malloc(hash_size * sizeof(pthread_rwlock_t));
+        assert(thread_files_lock);
+        for (m_rw = thread_files_lock, last_rw = thread_files_lock + hash_size; m_rw < last_rw; m_rw++) {
+            r = real_pthread_rwlock_init(m_rw, NULL);
+            assert(r == 0);
         }
 
         /* Listen for SIGUSR1 and print out a summary of what's happened so far
@@ -611,6 +633,10 @@ static unsigned long cond_hash(pthread_cond_t *cond) {
         return u % hash_size;
 }
 
+static unsigned long thread_hash(unsigned int tid) {
+    return (unsigned long)tid % hash_size;
+}
+
 static void lock_hash(pthread_mutex_t *lock_array, unsigned u) {
         int r;
 
@@ -626,9 +652,29 @@ static void lock_hash(pthread_mutex_t *lock_array, unsigned u) {
 
 static void unlock_hash(pthread_mutex_t *lock_array, unsigned u) {
         int r;
-
         r = real_pthread_mutex_unlock(lock_array + u);
         assert(r == 0);
+}
+
+static void thread_hash_rlock(unsigned u) {
+    //TODO: write
+    int r;
+    r = real_pthread_rwlock_rdlock(thread_files_lock + u);
+    assert(r == 0);
+
+}
+
+static void thread_hash_wlock(unsigned u) {
+    // TODO: write
+    int r;
+    r = real_pthread_rwlock_rdlock(thread_files_lock + u);
+    assert(r == 0);
+}
+
+static void thread_hash_unlock(unsigned u) {
+    int r;
+    r = real_pthread_rwlock_unlock(thread_files_lock + u);
+    assert(r == 0);
 }
 
 #define lock_hash_mutex(u) lock_hash(mutexes_lock, u)
@@ -1405,6 +1451,147 @@ static void mutex_info_release(pthread_mutex_t *mutex) {
         unlock_hash_mutex(u);
 }
 
+static struct thread_file_info *thread_file_info_insert(FILE *fp) {
+    unsigned long u;
+    struct thread_file_info *tfi;
+
+    tfi = calloc(1, sizeof(struct thread_file_info));
+    assert(tfi);
+    tfi->tid = _gettid();
+    tfi->fp = fp;
+
+    u = thread_hash(_gettid());
+    thread_hash_wlock(u);
+    tfi->next = thread_files[u];
+    thread_files[u] = tfi;
+    thread_hash_unlock(u);
+    return thread_files[u];
+}
+
+static FILE *thread_file_info_get_fp(void) {
+    unsigned long u;
+    struct thread_file_info *tfi;
+    FILE *fp;
+    char filename[64];
+
+    u = thread_hash(_gettid());
+    thread_hash_rlock(u);
+    for (tfi = thread_files[u]; tfi != NULL; tfi = tfi->next) {
+	if (tfi->tid == _gettid()) {
+            fp = tfi->fp;
+            thread_hash_unlock(u);
+            return fp;
+        }
+    }
+    thread_hash_unlock(u);
+    snprintf(filename, 64, "thread.%d.log", _gettid());
+    fp = fopen(filename, "w");
+    assert(fp != NULL);
+    thread_file_info_insert(fp);
+    return fp;
+}
+
+static void thread_file_remove(void) {
+    unsigned long u;
+    struct thread_file_info *tfi;
+    struct thread_file_info *prev_tfi;
+    int r;
+
+    u = thread_hash(_gettid());
+    //assert(thread_files[u] != NULL);
+    if (thread_files[u] == NULL) {
+	return;
+    }
+
+    thread_hash_wlock(u);
+    if (thread_files[u]->next == NULL) {
+        tfi = thread_files[u];
+        thread_files[u] = NULL;
+        thread_hash_unlock(u);
+
+        r = fclose(tfi->fp);
+        assert(r == 0);
+        free(tfi);
+        return;
+    }
+
+    else if (thread_files[u]->tid == _gettid()) {
+        tfi = thread_files[u];
+        thread_files[u] = thread_files[u]->next;
+        thread_hash_unlock(u);
+
+        r = fclose(tfi->fp);
+        assert(r == 0);
+        free(tfi);
+        return;
+    } else {
+
+        for (prev_tfi = thread_files[u], tfi = thread_files[u]->next; tfi != NULL; prev_tfi = tfi, tfi = tfi->next) {
+            if (tfi->tid == _gettid()) {
+                prev_tfi->next = tfi->next;
+                thread_hash_unlock(u);
+
+                break;
+            }
+        }
+    }
+
+    r = fclose(tfi->fp);
+    assert(r == 0);
+    free(tfi);
+    return;
+
+}
+
+#define TYPE_MUTEX (1)
+#define TYPE_COND (2)
+#define TYPE_RWLOCK (3)
+
+#define EVENT_TYPE_MUTEX_LOCK (1)
+#define EVENT_TYPE_MUTEX_UNLOCK (2)
+#define EVENT_TYPE_MUTEX_TIMEDLOCK (3)
+#define EVENT_TYPE_MUTEX_TRYLOCK (4)
+
+#define EVENT_TYPE_COND_SIGNAL (5)
+#define EVENT_TYPE_COND_BROADCAST (6)
+#define EVENT_TYPE_COND_WAIT_ENTRY (7)
+#define EVENT_TYPE_COND_WAIT_EXIT (17)
+#define EVENT_TYPE_COND_TIMEDWAIT_ENTRY (8)
+#define EVENT_TYPE_COND_TIMEDWAIT_EXIT (17)
+
+#define EVENT_TYPE_RWLOCK_RDLOCK (9)
+#define EVENT_TYPE_RWLOCK_TRYRDLOCK (10)
+#define EVENT_TYPE_RWLOCK_TIMEDRDLOCK (11)
+#define EVENT_TYPE_RWLOCK_WRLOCK (12)
+#define EVENT_TYPE_RWLOCK_TRYWRLOCK (13)
+#define EVENT_TYPE_RWLOCK_TIMEDWRLOCK (14)
+#define EVENT_TYPE_RWLOCK_UNLOCK (15)
+
+
+static void log_event(unsigned int obj_type, void *obj_addr, unsigned int event_type) {
+    unsigned int tid;
+    char buf[128];
+    FILE *fstream;
+    uint64_t thread_ns;
+    uint64_t curr_ns;
+    struct timespec t_res;
+    struct timespec t_cur;
+    int r;
+
+    fstream = thread_file_info_get_fp();
+    tid = _gettid();
+    r = clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t_res);
+    assert(r == 0);
+    thread_ns = 1000000000ULL * (uint64_t)t_res.tv_sec + (uint64_t)t_res.tv_nsec;
+
+    r = clock_gettime(CLOCK_REALTIME, &t_cur);
+    assert(r == 0);
+    curr_ns = 1000000000ULL * (uint64_t)t_cur.tv_sec + (uint64_t)t_cur.tv_nsec;
+
+    snprintf(buf, 128, "%d %llu %llu %d %p %d", tid, thread_ns, curr_ns, obj_type, obj_addr, event_type);
+    fprintf(fstream, "%s\n", buf);
+}
+
 int pthread_mutex_init(pthread_mutex_t *mutex, const pthread_mutexattr_t *mutexattr) {
         int r;
         unsigned long u;
@@ -1518,6 +1705,7 @@ static void mutex_lock(pthread_mutex_t *mutex, bool busy, uint64_t nsec_contende
         recursive = false;
 }
 
+
 int pthread_mutex_lock(pthread_mutex_t *mutex) {
         int r;
         bool busy;
@@ -1537,6 +1725,7 @@ int pthread_mutex_lock(pthread_mutex_t *mutex) {
 
         load_functions();
 
+        log_event(TYPE_MUTEX, mutex, EVENT_TYPE_MUTEX_LOCK);
         r = real_pthread_mutex_trylock(mutex);
         if (UNLIKELY(r != EBUSY && r != 0))
                 return r;
@@ -1568,6 +1757,8 @@ int pthread_mutex_timedlock(pthread_mutex_t *mutex, const struct timespec *absti
 
         load_functions();
 
+        log_event(TYPE_MUTEX, mutex, EVENT_TYPE_MUTEX_TIMEDLOCK);
+
         r = real_pthread_mutex_trylock(mutex);
         if (UNLIKELY(r != EBUSY && r != 0))
                 return r;
@@ -1591,13 +1782,14 @@ int pthread_mutex_timedlock(pthread_mutex_t *mutex, const struct timespec *absti
 
 int pthread_mutex_trylock(pthread_mutex_t *mutex) {
         int r;
-
         if (UNLIKELY(!initialized && recursive)) {
                 assert(!threads_existing);
                 return 0;
         }
 
         load_functions();
+
+        log_event(TYPE_MUTEX, mutex, EVENT_TYPE_MUTEX_TRYLOCK);
 
         r = real_pthread_mutex_trylock(mutex);
         if (UNLIKELY(r != 0))
@@ -1638,13 +1830,14 @@ static void mutex_unlock(pthread_mutex_t *mutex) {
 }
 
 int pthread_mutex_unlock(pthread_mutex_t *mutex) {
-
         if (UNLIKELY(!initialized && recursive)) {
                 assert(!threads_existing);
                 return 0;
         }
 
         load_functions();
+
+        log_event(TYPE_MUTEX, mutex, EVENT_TYPE_MUTEX_UNLOCK);
 
         mutex_unlock(mutex);
 
@@ -1713,6 +1906,7 @@ static void cond_info_release(pthread_cond_t *cond) {
         u = cond_hash(cond);
         unlock_hash_cond(u);
 }
+
 
 int pthread_cond_init(pthread_cond_t *cond, const pthread_condattr_t *attr) {
         int r;
@@ -1812,13 +2006,13 @@ static void cond_signal(pthread_cond_t *cond, bool is_broadcast) {
 
 int pthread_cond_signal(pthread_cond_t *cond) {
         int r;
-
         if (UNLIKELY(!initialized && recursive)) {
                 assert(!threads_existing);
                 return 0;
         }
 
         load_functions();
+
 
         r = real_pthread_cond_signal(cond);
         if (UNLIKELY(r != 0))
@@ -1831,13 +2025,13 @@ int pthread_cond_signal(pthread_cond_t *cond) {
 
 int pthread_cond_broadcast(pthread_cond_t *cond) {
         int r;
-
         if (UNLIKELY(!initialized && recursive)) {
                 assert(!threads_existing);
                 return 0;
         }
 
         load_functions();
+
 
         r = real_pthread_cond_broadcast(cond);
         if (UNLIKELY(r != 0))
@@ -1912,10 +2106,10 @@ static void cond_wait_finish(pthread_cond_t *cond, pthread_mutex_t *mutex, uint6
 int pthread_cond_wait(pthread_cond_t *cond, pthread_mutex_t *mutex) {
         int r;
         uint64_t start_time, wait_time = 0;
-
         assert(initialized || !recursive);
 
         load_functions();
+
 
         cond_wait_start(cond, mutex);
         mutex_unlock(mutex);
@@ -1935,10 +2129,10 @@ int pthread_cond_wait(pthread_cond_t *cond, pthread_mutex_t *mutex) {
 int pthread_cond_timedwait(pthread_cond_t *cond, pthread_mutex_t *mutex, const struct timespec *abstime) {
         int r;
         uint64_t start_time, wait_time = 0;
-
         assert(initialized || !recursive);
 
         load_functions();
+
 
         cond_wait_start(cond, mutex);
         mutex_unlock(mutex);
@@ -1952,6 +2146,7 @@ int pthread_cond_timedwait(pthread_cond_t *cond, pthread_mutex_t *mutex, const s
         mutex_lock(mutex, false, 0);
         cond_wait_finish(cond, mutex, wait_time);
 
+
         return r;
 }
 
@@ -1959,7 +2154,6 @@ int pthread_create(pthread_t *newthread,
                    const pthread_attr_t *attr,
                    void *(*start_routine) (void *),
                    void *arg) {
-
         load_functions();
 
         if (UNLIKELY(!threads_existing)) {
@@ -2071,6 +2265,7 @@ static void rwlock_info_release(pthread_rwlock_t *rwlock) {
         u = rwlock_hash(rwlock);
         unlock_hash_mutex(u);
 }
+
 
 int pthread_rwlock_init(pthread_rwlock_t *rwlock, const pthread_rwlockattr_t *attr) {
         int r;
@@ -2192,13 +2387,13 @@ int pthread_rwlock_rdlock(pthread_rwlock_t *rwlock) {
         int r;
         bool busy;
         uint64_t wait_time = 0;
-
         if (UNLIKELY(!initialized && recursive)) {
                 assert(!threads_existing);
                 return 0;
         }
 
         load_functions();
+
 
         r = real_pthread_rwlock_tryrdlock(rwlock);
         if (UNLIKELY(r != EBUSY && r != 0))
@@ -2223,13 +2418,13 @@ int pthread_rwlock_rdlock(pthread_rwlock_t *rwlock) {
 
 int pthread_rwlock_tryrdlock(pthread_rwlock_t *rwlock) {
         int r;
-
         if (UNLIKELY(!initialized && recursive)) {
                 assert(!threads_existing);
                 return 0;
         }
 
         load_functions();
+
 
         r = real_pthread_rwlock_tryrdlock(rwlock);
         if (UNLIKELY(r != EBUSY && r != 0))
@@ -2243,7 +2438,6 @@ int pthread_rwlock_timedrdlock(pthread_rwlock_t *rwlock, const struct timespec *
         int r;
         bool busy;
         uint64_t wait_time = 0;
-
         if (UNLIKELY(!initialized && recursive)) {
                 assert(!threads_existing);
                 return 0;
@@ -2276,13 +2470,13 @@ int pthread_rwlock_wrlock(pthread_rwlock_t *rwlock) {
         int r;
         bool busy;
         uint64_t wait_time = 0;
-
         if (UNLIKELY(!initialized && recursive)) {
                 assert(!threads_existing);
                 return 0;
         }
 
         load_functions();
+
 
         r = real_pthread_rwlock_trywrlock(rwlock);
         if (UNLIKELY(r != EBUSY && r != 0))
@@ -2307,13 +2501,13 @@ int pthread_rwlock_wrlock(pthread_rwlock_t *rwlock) {
 
 int pthread_rwlock_trywrlock(pthread_rwlock_t *rwlock) {
         int r;
-
         if (UNLIKELY(!initialized && recursive)) {
                 assert(!threads_existing);
                 return 0;
         }
 
         load_functions();
+
 
         r = real_pthread_rwlock_trywrlock(rwlock);
         if (UNLIKELY(r != EBUSY && r != 0))
@@ -2327,13 +2521,13 @@ int pthread_rwlock_timedwrlock(pthread_rwlock_t *rwlock, const struct timespec *
         int r;
         bool busy;
         uint64_t wait_time = 0;
-
         if (UNLIKELY(!initialized && recursive)) {
                 assert(!threads_existing);
                 return 0;
         }
 
         load_functions();
+
 
         r = real_pthread_rwlock_trywrlock(rwlock);
         if (UNLIKELY(r != EBUSY && r != 0))
@@ -2394,7 +2588,6 @@ static void rwlock_unlock(pthread_rwlock_t *rwlock) {
 }
 
 int pthread_rwlock_unlock(pthread_rwlock_t *rwlock) {
-
         if (UNLIKELY(!initialized && recursive)) {
                 assert(!threads_existing);
                 return 0;
@@ -2405,4 +2598,14 @@ int pthread_rwlock_unlock(pthread_rwlock_t *rwlock) {
         rwlock_unlock(rwlock);
 
         return real_pthread_rwlock_unlock(rwlock);
+}
+
+void pthread_exit(void *value_ptr) {
+    load_functions();
+
+    assert(threads_existing);
+
+    thread_file_remove();
+    real_pthread_exit(value_ptr);
+     __builtin_unreachable();
 }
